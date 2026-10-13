@@ -53,7 +53,9 @@ public:
         for (;;) {
             const auto now = Clock::now();
             if (abs_time <= now) {
-                return false;
+                // Plazo vencido (o timeout 0): como std::timed_mutex, intentar al menos
+                // una vez sin bloquear en lugar de fallar sin mirar el mutex.
+                return try_lock();
             }
 
             const auto rel_ms = std::chrono::ceil<std::chrono::milliseconds>(abs_time - now);

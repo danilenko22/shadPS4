@@ -15,6 +15,8 @@
 #include <dlfcn.h>
 #endif
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 
 namespace VideoCore {
@@ -25,6 +27,7 @@ enum class CaptureState {
     InProgress,
 };
 static CaptureState capture_state{CaptureState::Idle};
+static u32 capture_submits_left{0};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 
@@ -99,6 +102,8 @@ void StartCapture() {
     }
 
     if (capture_state == CaptureState::Triggered) {
+        const char* submits = std::getenv("SHADPS4_RDOC_SUBMITS");
+        capture_submits_left = submits ? std::max(1, std::atoi(submits)) : 1;
         rdoc_api->StartFrameCapture(nullptr, nullptr);
         capture_state = CaptureState::InProgress;
     }
@@ -109,7 +114,7 @@ void EndCapture() {
         return;
     }
 
-    if (capture_state == CaptureState::InProgress) {
+    if (capture_state == CaptureState::InProgress && --capture_submits_left == 0) {
         rdoc_api->EndFrameCapture(nullptr, nullptr);
         capture_state = CaptureState::Idle;
     }

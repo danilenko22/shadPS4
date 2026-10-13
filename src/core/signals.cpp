@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <unordered_map>
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
@@ -27,6 +29,62 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 namespace Core {
 
 #if defined(_WIN32)
+
+// NBA-DIAG: sondas con breakpoints de hardware puestos desde fuera (tools/probe.py).
+// DR0-DR2 son sondas de entrada; DR3 se usa automaticamente para capturar el retorno
+// de la ultima funcion sondeada (registra RAX). Siempre se reanuda con RF=1.
+static bool HandleNbaProbe(EXCEPTION_POINTERS* pExp) {
+    CONTEXT* ctx = pExp->ContextRecord;
+    const u64 dr6 = ctx->Dr6;
+    if ((dr6 & 0xF) == 0) {
+        return false;
+    }
+    static std::mutex probe_mutex;
+    static std::unordered_map<u64, u64> probe_hits;
+    const u64 rip = ctx->Rip;
+    u64 hits;
+    {
+        std::scoped_lock lk{probe_mutex};
+        hits = ++probe_hits[rip];
+    }
+    const bool verbose = hits <= 30 || (hits % 500) == 0;
+    if (dr6 & 0x8) {
+        // Retorno capturado: desactivar DR3
+        if (verbose) {
+            LOG_INFO(Debug, "NBA-PROBE ret at={:#x} rax={:#x} hits={}", rip, ctx->Rax, hits);
+        }
+        ctx->Dr7 &= ~((u64)0x3 << 6);
+        ctx->Dr7 &= ~((u64)0xF << 28);
+        ctx->Dr3 = 0;
+    } else {
+        if (verbose) {
+            const u64* sp = reinterpret_cast<const u64*>(ctx->Rsp);
+            std::string chain;
+            u64 rbp = ctx->Rbp;
+            for (int i = 0; i < 6; i++) {
+                if (rbp < ctx->Rsp || rbp > ctx->Rsp + 0x100000 || (rbp & 7)) {
+                    break;
+                }
+                const u64* fp = reinterpret_cast<const u64*>(rbp);
+                chain += fmt::format(" {:#x}", fp[1]);
+                rbp = fp[0];
+            }
+            LOG_INFO(Debug,
+                     "NBA-PROBE hit at={:#x} hits={} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} "
+                     "ret={:#x} chain:{}",
+                     rip, hits, ctx->Rdi, ctx->Rsi, ctx->Rdx, ctx->Rcx, sp[0], chain);
+        }
+        // Armar DR3 sobre la direccion de retorno (ejecucion, 1 byte)
+        if ((ctx->Dr7 & ((u64)0x3 << 6)) == 0) {
+            ctx->Dr3 = *reinterpret_cast<const u64*>(ctx->Rsp);
+            ctx->Dr7 &= ~((u64)0xF << 28);
+            ctx->Dr7 |= ((u64)0x1 << 6);
+        }
+    }
+    ctx->Dr6 = 0;
+    ctx->EFlags |= 0x10000; // RF
+    return true;
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -112,8 +170,12 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         guest_info._si_signo = POSIX_SIGILL;
         guest_info._si_code = POSIX_ILL_BADSTK; // i am not sure about this one either
         break;
-    case EXCEPTION_BREAKPOINT:
     case EXCEPTION_SINGLE_STEP:
+        if (HandleNbaProbe(pExp)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        [[fallthrough]];
+    case EXCEPTION_BREAKPOINT:
         guest_info._si_signo = POSIX_SIGTRAP;
         guest_info._si_code = POSIX_TRAP_BRKPT;
         break;
