@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Modified 2026-10-13 for the unofficial NBA LIVE 19 fork (see README-NBA19.md).
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_shared_memory_bounds.h"
