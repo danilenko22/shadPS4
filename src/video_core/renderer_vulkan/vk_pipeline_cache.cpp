@@ -330,17 +330,121 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     };
     WarmUp();
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
+    {
+        const u32 hw = std::thread::hardware_concurrency();
+        const u32 num_async = std::max(2u, hw / 4);
+        for (u32 i = 0; i < num_async; ++i) {
+            async_workers.emplace_back([this] { AsyncWorker(); });
+        }
+    }
+    // golf-fix: no VkPipelineCache object. With one, pipeline creation on the AMD driver was
+    // about 5x slower and serialized; with VK_NULL_HANDLE the driver uses its internal cache.
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    if (golf_preload) {
+        golf_preload->stop = true;
+        for (auto& w : golf_preload->workers) {
+            if (w.joinable()) {
+                w.join();
+            }
+        }
+    }
+    {
+        std::scoped_lock lk{async_mutex};
+        async_stop = true;
+    }
+    async_cv.notify_all();
+    for (auto& w : async_workers) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+}
+
+void PipelineCache::AsyncWorker() {
+    while (true) {
+        std::shared_ptr<AsyncGraphicsJob> job;
+        {
+            std::unique_lock lk{async_mutex};
+            async_cv.wait(lk, [this] { return async_stop || !async_queue.empty(); });
+            if (async_stop) {
+                return;
+            }
+            job = std::move(async_queue.front());
+            async_queue.pop_front();
+        }
+        job->result = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, job->key, vk::PipelineCache{}, job->copy_ptrs,
+            job->runtime_infos, job->fetch ? &*job->fetch : nullptr, job->modules, job->sdata,
+            false);
+        job->done.store(true, std::memory_order_release);
+    }
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
+        return nullptr;
+    }
+    if (const auto found = graphics_pipelines.find(graphics_key);
+        found != graphics_pipelines.end()) {
+        return found->second.get();
+    }
+    if (golf_preload) {
+        if (const auto it = golf_preload->index.find(graphics_key);
+            it != golf_preload->index.end()) {
+            const size_t i = it->second;
+            auto& st = golf_preload->state[i];
+            u8 expected = 0;
+            if (st.compare_exchange_strong(expected, 1)) {
+                GolfBuildPreloaded(i); // needed now: build it on this thread
+            }
+            if (st.load(std::memory_order_acquire) != 2) {
+                return nullptr; // a background thread is building it: skip this draw
+            }
+            if (auto& built = golf_preload->built[i]) {
+                auto* ptr = built.get();
+                graphics_pipelines.try_emplace(graphics_key).first.value() = std::move(built);
+                return ptr;
+            }
+        }
+    }
+    if (!async_workers.empty()) {
+        if (const auto j = async_jobs.find(graphics_key); j != async_jobs.end()) {
+            const auto job = j->second;
+            if (!job->done.load(std::memory_order_acquire)) {
+                return nullptr; // still compiling in the background: skip this draw
+            }
+            job->result->GolfFixRebindStages(job->live_infos);
+            RegisterPipelineData(graphics_key, std::hash<GraphicsPipelineKey>{}(graphics_key),
+                                 job->sdata);
+            ++num_new_pipelines;
+            auto* ptr = job->result.get();
+            graphics_pipelines.try_emplace(graphics_key).first.value() = std::move(job->result);
+            async_jobs.erase(j);
+            return ptr;
+        }
+        auto job = std::make_shared<AsyncGraphicsJob>();
+        job->key = graphics_key;
+        job->live_infos = infos;
+        for (u32 s = 0; s < MaxShaderStages; ++s) {
+            if (infos[s]) {
+                job->info_copies[s].emplace(*infos[s]);
+                job->copy_ptrs[s] = &*job->info_copies[s];
+            }
+        }
+        job->runtime_infos = runtime_infos;
+        if (fetch_shader) {
+            job->fetch = *fetch_shader;
+        }
+        job->modules = modules;
+        async_jobs.emplace(graphics_key, job);
+        {
+            std::scoped_lock lk{async_mutex};
+            async_queue.push_back(std::move(job));
+        }
+        async_cv.notify_one();
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -350,7 +454,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+            instance, scheduler, desc_heap, profile, graphics_key, vk::PipelineCache{}, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
@@ -379,7 +483,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *infos[0],
+                                                       vk::PipelineCache{}, compute_key, *infos[0],
                                                        modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
@@ -654,6 +758,17 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+static bool GolfPermInStore(u64 pgm_hash, size_t perm_idx) {
+    if (!Storage::DataBase::Instance().IsOpened()) {
+        return false;
+    }
+    std::vector<u8> meta;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
+                                       fmt::format("{:#018x}", HashCombine(pgm_hash, perm_idx)),
+                                       meta);
+    return !meta.empty();
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -663,13 +778,18 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+        size_t first_idx = 0; // golf-fix: see GolfPermInStore
+        while (first_idx < 256 && GolfPermInStore(params.hash, first_idx)) {
+            ++first_idx;
+        }
+        const auto module =
+            CompileModule(program->info, runtime_info, params.code, first_idx, binding);
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = HashCombine(params.hash, first_idx);
 
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
+        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, first_idx);
+        program->InsertPermut(module, std::move(spec), first_idx);
+        if (auto& fetch = program->modules[first_idx].spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
         }
         return std::make_tuple(&program->info, module, perm_hash);
@@ -689,11 +809,18 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
+        // golf-fix: the cache names a permutation by its index. An index that the store already
+        // holds (from a permutation that was not preloaded this run) must not be reused, or old
+        // pipelines in the store get this permutation's SPIR-V and crash the driver on preload.
+        while (perm_idx < program->modules.size() + 256 && GolfPermInStore(params.hash, perm_idx)) {
+            ++perm_idx;
+        }
+        perm_hash = HashCombine(params.hash, perm_idx);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
         module = it->module;

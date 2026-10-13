@@ -104,13 +104,15 @@ void DataBase::Open() {
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
                                      MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
             !mz_zip_validate_archive(&zip_ar, 0)) {
-            LOG_INFO(Render, "Cache archive {} is not found or archive is corrupted",
-                     cache_path.string().c_str());
+            LOG_ERROR(Render, "golf-fix: cache archive {} is not found or is corrupted",
+                      cache_path.string().c_str());
             mz_zip_reader_end(&zip_ar);
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
-        cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
+        // golf-fix v23: a folder of loose files survives a forced exit (a zip archive needs to be
+        // finalized at exit or it is lost). Use a fresh folder so old caches are not mixed in.
+        cache_path = GetUserPath(PathType::CacheDir) / (std::string{game_info.GameSerial()} + "-golf");
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }
@@ -147,7 +149,7 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                 ASSERT_MSG(!ar_is_read_only,
                            "The archive is read-only. Did you forget to call `FinishPreload`?");
                 if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
-                                           v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
+                                           v.size() * sizeof(T), MZ_BEST_SPEED)) {
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
             } else {
@@ -182,6 +184,10 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
         v.resize(stat.m_uncomp_size / sizeof(T));
         mz_zip_reader_extract_to_mem(&zip_ar, index, v.data(), stat.m_uncomp_size, 0);
     } else {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) { // golf-fix v23: missing blob is not an error
+            return;
+        }
         const auto file = IOFile{path, FileAccessMode::Read};
         v.resize(file.GetSize() / sizeof(T));
         file.Read(v);

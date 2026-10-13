@@ -52,6 +52,7 @@ struct ImageSpecialization {
     AmdGpu::NumberConversion num_conversion{};
     // FIXME any pipeline cache changes needed?
     u32 num_bindings = 0;
+    bool single_mip = false; // golf-fix v22
 
     bool operator==(const ImageSpecialization&) const = default;
 };
@@ -63,9 +64,19 @@ struct FMaskSpecialization {
     bool operator==(const FMaskSpecialization&) const = default;
 };
 
+// golf-fix v22: true when minification and magnification use the same filter kind, so a
+// sample from a single-level image gives the same result at any LOD.
+inline bool GolfSameMinMag(const AmdGpu::Sampler& sharp) {
+    const auto lin = [](AmdGpu::Filter f) {
+        return f == AmdGpu::Filter::Bilinear || f == AmdGpu::Filter::AnisoLinear;
+    };
+    return lin(sharp.xy_mag_filter) == lin(sharp.xy_min_filter);
+}
+
 struct SamplerSpecialization {
     u8 force_unnormalized : 1;
     u8 force_degamma : 1;
+    u8 same_minmag : 1; // golf-fix v22
 
     bool operator==(const SamplerSpecialization&) const = default;
 };
@@ -140,6 +151,7 @@ struct StageSpecialization {
                          }
                          spec.num_conversion = sharp.GetNumberConversion();
                          spec.num_bindings = desc.NumBindings(*info);
+                         spec.single_mip = !desc.is_written && sharp.NumViewLevels(desc.is_array) == 1;
                      });
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
@@ -150,6 +162,7 @@ struct StageSpecialization {
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
                          spec.force_unnormalized = sharp.force_unnormalized;
                          spec.force_degamma = sharp.force_degamma;
+                         spec.same_minmag = GolfSameMinMag(sharp);
                      });
 
         // Initialize runtime_info fields that rely on analysis in tessellation passes

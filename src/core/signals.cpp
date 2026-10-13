@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
@@ -26,7 +27,54 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 
 namespace Core {
 
+// golf-fix: set while the warmup builds a pipeline inside an SEH guard
+static thread_local bool golf_seh_guard = false;
+void GolfSetSehGuard(bool on) {
+    golf_seh_guard = on;
+}
+
 #if defined(_WIN32)
+
+// golf-fix: log module+offset frames for unhandled crashes so they can be resolved with the .map
+static void GolfFixLogCrash(EXCEPTION_POINTERS* pExp) noexcept {
+    if (pExp == nullptr || pExp->ContextRecord == nullptr) {
+        return;
+    }
+    const auto describe = [](DWORD64 pc) -> std::string {
+        HMODULE mod{};
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(pc), &mod) &&
+            mod != nullptr) {
+            GetModuleFileNameA(mod, name, MAX_PATH);
+            const char* base = std::strrchr(name, '\\');
+            return fmt::format("{}+{:#x}", base ? base + 1 : name,
+                               pc - reinterpret_cast<DWORD64>(mod));
+        }
+        return fmt::format("{:#x} (sin modulo)", pc);
+    };
+    const auto* rec = pExp->ExceptionRecord;
+    if (rec && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+        LOG_CRITICAL(Debug, "golf-fix crash: {} en direccion {:#x}",
+                     rec->ExceptionInformation[0] == 1 ? "escritura" : "lectura",
+                     rec->ExceptionInformation[1]);
+    }
+    CONTEXT ctx = *pExp->ContextRecord;
+    LOG_CRITICAL(Debug, "golf-fix crash: rip={:#x} rsp={:#x}", ctx.Rip, ctx.Rsp);
+    for (int i = 0; i < 24 && ctx.Rip != 0; ++i) {
+        LOG_CRITICAL(Debug, "golf-fix frame {}: {}", i, describe(ctx.Rip));
+        DWORD64 image_base{};
+        auto* fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        if (fn == nullptr) {
+            break;
+        }
+        PVOID handler_data{};
+        DWORD64 establisher{};
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data,
+                         &establisher, nullptr);
+    }
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -139,10 +187,17 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         }
     }
 
+    if (golf_seh_guard) {
+        LOG_CRITICAL(Debug, "golf-fix: exception {:#x} at {} inside guarded driver call", code,
+                     address);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     const bool report_unhandled =
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        GolfFixLogCrash(pExp);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

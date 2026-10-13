@@ -144,8 +144,25 @@ Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1,
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
+// golf-fix v22: an implicit-LOD sample of a single-level image only uses its derivatives to
+// choose between the min and mag filters (and anisotropy). Inside divergent control flow those
+// derivatives are undefined in Vulkan (GCN keeps the values of inactive lanes), which produced
+// dashed lines in Everybody's Golf shadows. When both filters match, sample at LOD 0 instead.
+static bool GolfForceLodZero(EmitContext& ctx, u32 handle) {
+    if (ctx.info.hw_stage != HwStage::Fragment) {
+        return false;
+    }
+    const auto& texture = ctx.images[handle & 0xFFFF];
+    const u32 samp = handle >> 16;
+    return texture.single_mip && samp < ctx.sampler_same_minmag.size() &&
+           ctx.sampler_same_minmag[samp];
+}
+
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
                               const IR::Value& offset) {
+    if (GolfForceLodZero(ctx, handle)) {
+        return EmitImageSampleExplicitLod(ctx, inst, handle, coords, ctx.f32_zero_value, offset);
+    }
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
     const Id result_type = texture.data_types->Get(4);
@@ -178,6 +195,10 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
 
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
                                   Id bias, const IR::Value& offset) {
+    if (GolfForceLodZero(ctx, handle)) {
+        return EmitImageSampleDrefExplicitLod(ctx, inst, handle, coords, dref, ctx.f32_zero_value,
+                                              offset);
+    }
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
     const Id result_type = texture.data_types->Get(1);

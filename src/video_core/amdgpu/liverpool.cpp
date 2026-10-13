@@ -18,6 +18,10 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
+namespace Vulkan {
+void GolfCheckVertexSnapshots();
+}
+
 namespace AmdGpu {
 
 static const char* dcb_task_name{"DCB_TASK"};
@@ -243,12 +247,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         switch (type) {
         default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
-        case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+            LOG_WARNING(Render, "Skipping PM4 packet of type {} at dcb offset {:#x}", type,
+                        reinterpret_cast<uintptr_t>(dcb.data()) - base_addr);
+            dcb = NextPacket(dcb, 1);
+            continue;
+        case 0: {
+            // Type-0 packets are not used by the PS4 driver; treat them as padding.
+            const u32 skip = header->type0.NumWords() + 1;
+            LOG_WARNING(Render,
+                        "Skipping PM4 type 0 packet (raw {:#x}, base reg {}, size {}) at dcb "
+                        "offset {:#x}",
+                        header->raw, header->type0.base.Value(), header->type0.NumWords(),
+                        reinterpret_cast<uintptr_t>(dcb.data()) - base_addr);
+            dcb = NextPacket(dcb, skip);
+            continue;
+        }
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -834,7 +847,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WaitOnCeCounter: {
-                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                while (ce_task.handle && cblock.ce_count <= cblock.de_count &&
+                       !ce_task.handle.done()) {
                     RESUME_GFX(ce_task);
                 }
                 break;

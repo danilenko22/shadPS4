@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <tsl/robin_set.h>
+#include <atomic>
+#include <chrono>
+#include <algorithm>
+#include <semaphore>
+#include <thread>
+#include <vector>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -12,12 +19,25 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 9u;
+static constexpr u32 ShaderBinaryVersion = 12u; // golf-fix v22: LOD 0 for single-level samples
 static constexpr u32 ShaderMetaVersion = 6u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
+namespace Core {
+void GolfSetSehGuard(bool on);
+}
+
 namespace Vulkan {
+
+// golf-fix: run a driver call so that an access violation inside it skips that pipeline instead
+// of closing the emulator.
+[[maybe_unused]] static bool GolfGuardedCall(void (*fn)(void*), void* ctx) {
+    // An SEH guard here left a driver lock held after a crash and hung the game, so the build
+    // is called directly.
+    fn(ctx);
+    return true;
+}
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -157,10 +177,15 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     }
 
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
-    ASSERT(is_new);
+    if (!is_new) {
+        // golf-fix: the archive can hold the same key twice after a cache version bump
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        return true;
+    }
 
     it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
+        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, vk::PipelineCache{},
                                           compute_key, *infos[0], modules[0], sdata, true);
 
     infos.fill(nullptr);
@@ -206,6 +231,10 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    golf_spv_bytes = 0;
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader = nullptr;
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -231,11 +260,33 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         }
     }
 
+    if (pending_graphics) {
+        auto& pending = pending_graphics->emplace_back();
+        pending.key = graphics_key;
+        pending.infos = infos;
+        pending.runtime_infos = runtime_infos;
+        if (fetch_shader) {
+            pending.fetch = *fetch_shader;
+        }
+        pending.modules = modules;
+        pending.sdata = std::move(sdata);
+        pending.spv_bytes = golf_spv_bytes;
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader = nullptr;
+        return true;
+    }
+
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
-    ASSERT(is_new);
+    if (!is_new) {
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader = nullptr;
+        return true;
+    }
 
     it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+        instance, scheduler, desc_heap, profile, graphics_key, vk::PipelineCache{}, infos,
         runtime_infos, fetch_shader, modules, sdata, true);
 
     infos.fill(nullptr);
@@ -261,6 +312,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (spv.empty()) {
         return false;
     }
+    golf_spv_bytes += spv.size() * sizeof(u32);
 
     // Permutation hash depends on shader variation index. To prevent collisions, we need insert it
     // at the exact position rather than append
@@ -301,6 +353,25 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     return true;
 }
 
+void PipelineCache::GolfBuildPreloaded(size_t i) {
+    auto& pre = *golf_preload;
+    auto& p = pre.pending[i];
+    auto pipeline = std::make_unique<GraphicsPipeline>(
+        instance, scheduler, desc_heap, profile, p.key, vk::PipelineCache{}, p.copy_ptrs,
+        p.runtime_infos, p.fetch ? &*p.fetch : nullptr, p.modules, p.sdata, true);
+    pipeline->GolfFixRebindStages(p.infos);
+    pre.built[i] = std::move(pipeline);
+    pre.state[i].store(2, std::memory_order_release);
+    const size_t done = pre.finished.fetch_add(1) + 1;
+    if (done == pre.pending.size()) {
+        LOG_ERROR(Render, "golf-fix: background build of {} cached pipelines finished in {} ms",
+                  done,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - pre.start)
+                      .count());
+    }
+}
+
 void PipelineCache::WarmUp() {
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
@@ -312,6 +383,7 @@ void PipelineCache::WarmUp() {
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
     if (profile_data.empty()) {
+        LOG_ERROR(Render, "golf-fix warmup: pipeline cache is empty, shaders will be compiled");
         Storage::DataBase::Instance().FinishPreload();
 
         profile_data.resize(sizeof(profile));
@@ -321,7 +393,7 @@ void PipelineCache::WarmUp() {
         return;
     }
     if (profile_data.size() != sizeof(Shader::Profile)) {
-        LOG_WARNING(Render,
+        LOG_ERROR(Render,
                     "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
                     profile_data.size(), sizeof(Shader::Profile));
         Storage::DataBase::Instance().Close();
@@ -331,18 +403,38 @@ void PipelineCache::WarmUp() {
     Shader::Profile cached_profile{};
     std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
     if (cached_profile != profile) {
-        LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
+        LOG_ERROR(Render,
+                  "Pipeline cache isn't compatible with current system. Ignoring the cache");
         Storage::DataBase::Instance().Close();
         return;
     }
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+    // golf-fix: bound the blocking warm-up so the game always starts; the rest compile on demand
+    const auto warmup_start = std::chrono::steady_clock::now();
+    constexpr auto warmup_budget = std::chrono::seconds(60);
+    bool warmup_budget_hit = false;
+    std::vector<PendingGraphicsPipeline> pending;
+    pending_graphics = &pending;
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            if (warmup_budget_hit) {
+                return;
+            }
+            const auto elapsed = std::chrono::steady_clock::now() - warmup_start;
+            if (elapsed > warmup_budget) {
+                warmup_budget_hit = true;
+                LOG_ERROR(Render, "golf-fix warmup: time budget reached after {} pipelines",
+                          num_pipelines);
+                return;
+            }
+            if (num_total_pipelines % 100 == 0) {
+                LOG_ERROR(Render, "golf-fix warmup: {} pipelines loaded, {} s", num_pipelines,
+                          std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+            }
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
@@ -368,6 +460,75 @@ void PipelineCache::WarmUp() {
             }
         });
 
+    pending_graphics = nullptr;
+
+    // golf-fix: build the deferred graphics pipelines on all cores. Pipeline creation only reads
+    // the stage infos and creates Vulkan objects, which the driver allows from many threads.
+    {
+        const auto build_start = std::chrono::steady_clock::now();
+        {
+            // The store can hold one pipeline key several times. Building the same pipeline on
+            // two threads at once crashes the AMD driver, so keep only the first copy.
+            tsl::robin_set<GraphicsPipelineKey> seen;
+            std::vector<PendingGraphicsPipeline> unique;
+            unique.reserve(pending.size());
+            for (auto& p : pending) {
+                if (seen.insert(p.key).second) {
+                    unique.push_back(std::move(p));
+                }
+            }
+            if (unique.size() != pending.size()) {
+                LOG_ERROR(Render, "golf-fix warmup: skipped {} duplicate graphics pipelines",
+                          pending.size() - unique.size());
+            }
+            pending = std::move(unique);
+        }
+        auto pre = std::make_unique<GolfPreload>();
+        pre->pending = std::move(pending);
+        const size_t n = pre->pending.size();
+        pre->built.resize(n);
+        pre->state = std::make_unique<std::atomic<u8>[]>(n);
+        for (size_t i = 0; i < n; ++i) {
+            auto& p = pre->pending[i];
+            for (size_t s = 0; s < MaxShaderStages; ++s) {
+                if (p.infos[s]) {
+                    // The GPU thread keeps updating the live infos; build from a copy.
+                    p.info_copies[s].emplace(*p.infos[s]);
+                    p.copy_ptrs[s] = &*p.info_copies[s];
+                }
+            }
+            pre->index.emplace(p.key, i);
+        }
+        pre->start = std::chrono::steady_clock::now();
+        golf_preload = std::move(pre);
+        const u32 hw = std::thread::hardware_concurrency();
+        const u32 num_threads = std::max(1u, hw > 2 ? hw - 2 : 1u);
+        for (u32 t = 0; t < num_threads; ++t) {
+            golf_preload->workers.emplace_back([this, n] {
+                auto& pre = *golf_preload;
+                while (!pre.stop.load(std::memory_order_relaxed)) {
+                    const size_t i = pre.next.fetch_add(1);
+                    if (i >= n) {
+                        break;
+                    }
+                    u8 expected = 0;
+                    if (pre.state[i].compare_exchange_strong(expected, 1)) {
+                        GolfBuildPreloaded(i);
+                    }
+                }
+            });
+        }
+        LOG_ERROR(Render,
+                  "golf-fix warmup: {} graphics pipelines will be built in the background on {} "
+                  "threads (dedupe/load took {} ms)",
+                  n, num_threads,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - build_start)
+                      .count());
+    }
+
+    LOG_ERROR(Render, "golf-fix warmup: preloaded {} of {} pipelines", num_pipelines,
+              num_total_pipelines);
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",

@@ -3,7 +3,16 @@
 
 #pragma once
 
+#include <chrono>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <variant>
+#include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -139,6 +148,59 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    // golf-fix: graphics pipelines deserialized during warm-up, built later in parallel
+    struct PendingGraphicsPipeline {
+        GraphicsPipelineKey key{};
+        std::array<const Shader::Info*, MaxShaderStages> infos{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        GraphicsPipeline::SerializationSupport sdata{};
+        size_t spv_bytes{};
+        std::array<std::optional<Shader::Info>, MaxShaderStages> info_copies{};
+        std::array<const Shader::Info*, MaxShaderStages> copy_ptrs{};
+    };
+    std::vector<PendingGraphicsPipeline>* pending_graphics{};
+
+    // golf-fix: cached pipelines are built in the background after the game has started; a
+    // pipeline the game needs first is built right away on the GPU thread.
+    struct GolfPreload {
+        std::vector<PendingGraphicsPipeline> pending;
+        std::vector<std::unique_ptr<GraphicsPipeline>> built;
+        std::unique_ptr<std::atomic<u8>[]> state; // 0 waiting, 1 building, 2 ready
+        tsl::robin_map<GraphicsPipelineKey, size_t> index;
+        std::atomic<size_t> next{0};
+        std::atomic<size_t> finished{0};
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> workers;
+        std::chrono::steady_clock::time_point start{};
+    };
+    std::unique_ptr<GolfPreload> golf_preload;
+    void GolfBuildPreloaded(size_t i);
+    size_t golf_spv_bytes{}; // SPIR-V size of the stages loaded for the current pipeline
+
+    // golf-fix: new graphics pipelines are built on background threads; the draw is skipped
+    // until the pipeline is ready instead of stalling the GPU thread.
+    struct AsyncGraphicsJob {
+        GraphicsPipelineKey key{};
+        std::array<std::optional<Shader::Info>, MaxShaderStages> info_copies{};
+        std::array<const Shader::Info*, MaxShaderStages> copy_ptrs{};
+        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        GraphicsPipeline::SerializationSupport sdata{};
+        std::unique_ptr<GraphicsPipeline> result{};
+        std::atomic<bool> done{false};
+    };
+    void AsyncWorker();
+    tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<AsyncGraphicsJob>> async_jobs;
+    std::mutex async_mutex;
+    std::condition_variable async_cv;
+    std::deque<std::shared_ptr<AsyncGraphicsJob>> async_queue;
+    bool async_stop{};
+    std::vector<std::thread> async_workers;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

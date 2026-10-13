@@ -12,10 +12,10 @@
 namespace Shader {
 
 static constexpr u32 NUM_USER_DATA_REGS = 16;
-static constexpr u32 NUM_IMAGES = 64;
-static constexpr u32 NUM_BUFFERS = 56;
-static constexpr u32 NUM_SAMPLERS = 16;
-static constexpr u32 NUM_FMASKS = 8;
+static constexpr u32 NUM_IMAGES = 128;
+static constexpr u32 NUM_BUFFERS = 112;
+static constexpr u32 NUM_SAMPLERS = 64;
+static constexpr u32 NUM_FMASKS = 32;
 
 using SharpLocation = u16;
 

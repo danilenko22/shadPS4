@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <limits>
+#include <span>
+#include <fmt/ranges.h>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -180,6 +183,28 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     });
 }
 
+void TextureCache::InvalidateMemoryFromDma(VAddr address, size_t size) {
+    // Upstream only marks the image whose base address equals the copy destination. Games that
+    // stream a whole texture pack with one DMA leave every other texture in the pack stale
+    // (Everybody's Golf: black grass patch around the hole).
+    u32 marked = 0;
+    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        const bool contained = begin >= address && end <= address + size;
+        if (begin == address || contained || False(image.flags & ImageFlagBits::GpuModified)) {
+            image.flags |= ImageFlagBits::GpuDirty;
+            ++marked;
+        }
+    });
+    static std::atomic<int> golf_logged{0};
+    if (marked > 1 && golf_logged < 24) {
+        ++golf_logged;
+        LOG_ERROR(Render, "golf-fix: DMA {:#x}+{:#x} marked {} textures for reupload", address,
+                  size, marked);
+    }
+}
+
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     SmallVector<ImageId, 16> deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -332,6 +357,23 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
+        }
+
+        // golf-fix v24: in PS4 Pro mode the same surface can be seen once without and once with
+        // the alternate (Neo) tiling, which pads it to a larger size. Recreate the image when it
+        // is free, otherwise keep using the cached one instead of aborting.
+        if (image_info.alt_tile != cache_image.info.alt_tile &&
+            image_info.size == cache_image.info.size &&
+            image_info.pitch == cache_image.info.pitch &&
+            image_info.resources == cache_image.info.resources) {
+            if (safe_to_delete) {
+                FreeImage(cache_image_id);
+                return {merged_image_id, -1, -1};
+            }
+            auto result_id = merged_image_id ? merged_image_id : cache_image_id;
+            const bool is_compatible = IsVulkanFormatCompatible(
+                slot_images[result_id].info.pixel_format, image_info.pixel_format);
+            return {is_compatible ? result_id : ImageId{}, -1, -1};
         }
 
         // Enhanced debug logging for unreachable case
@@ -586,6 +628,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
+    if (desc.type == BindingType::RenderTarget) {
+        image.rt_write_seq = ++rt_seq_counter;
+    }
 
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {
@@ -636,7 +681,58 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    if (desc.type == BindingType::Texture) {
+        SyncFromLargerTarget(image_id);
+    }
     return image.FindView(desc.view_info);
+}
+
+void TextureCache::SyncFromLargerTarget(ImageId image_id) {
+    // Some games (Everybody's Golf) render half/quarter resolution passes into the top-left
+    // viewport of a full resolution render target and then sample that memory through a smaller
+    // texture descriptor with the same pitch. On hardware both alias the same memory; here they are
+    // separate images, so copy the matching region from the most recently written target.
+    Image& dst = slot_images[image_id];
+    const auto& di = dst.info;
+    if (di.guest_address == 0 || di.resources.layers != 1 || di.num_samples != 1 ||
+        di.props.is_depth || di.props.is_block || di.type != AmdGpu::ImageType::Color2D) {
+        return;
+    }
+    ImageId best_id{};
+    u64 best_seq = std::max(dst.synced_seq, dst.rt_write_seq);
+    ForEachImageInRegion(di.guest_address, di.guest_size, [&](ImageId id, Image& src) {
+        if (id == image_id) {
+            return;
+        }
+        const auto& si = src.info;
+        if (si.guest_address != di.guest_address || src.rt_write_seq <= best_seq) {
+            return;
+        }
+        if (si.pitch != di.pitch || si.tile_mode != di.tile_mode || si.num_bits != di.num_bits ||
+            si.num_samples != 1 || si.pixel_format != di.pixel_format ||
+            si.type != AmdGpu::ImageType::Color2D) {
+            return;
+        }
+        if (si.size.width < di.size.width || si.size.height < di.size.height ||
+            si.size == di.size) {
+            return;
+        }
+        best_id = id;
+        best_seq = src.rt_write_seq;
+    });
+    if (!best_id) {
+        return;
+    }
+    Image& src = slot_images[best_id];
+    static u32 num_logged = 0;
+    if (num_logged < 16) {
+        ++num_logged;
+        LOG_INFO(Render_Vulkan, "golf-fix: syncing {}x{} texture from {}x{} target at {:#x}",
+                 di.size.width, di.size.height, src.info.size.width, src.info.size.height,
+                 di.guest_address);
+    }
+    runtime.CopyImageRegion(&src, &dst, di.size.width, di.size.height);
+    dst.synced_seq = best_seq;
 }
 
 void TextureCache::RegisterMeta(VAddr address, MetaDataInfo info) {
@@ -824,6 +920,41 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     scheduler.EndRendering();
+
+    if (image.info.size.width == 128 && image.info.size.height == 512) {
+        // golf-fix diagnostic: the grass texture around the hole (afternoon) is black
+        static std::atomic<int> golf_grass_logged{0};
+        if (golf_grass_logged < 12) {
+            ++golf_grass_logged;
+            const auto* b = std::bit_cast<const u8*>(image.info.guest_address);
+            const size_t mid = image.info.guest_size / 2;
+            LOG_ERROR(Render,
+                      "golf-fix: 128x512 upload at {:#x}+{:#x} fmt {} tile {} flags {:#x} "
+                      "head {:02x} mid {:02x}",
+                      image.info.guest_address, image.info.guest_size,
+                      vk::to_string(image.info.pixel_format), u32(image.info.tile_mode),
+                      u32(image.flags), fmt::join(std::span{b, 16}, " "),
+                      fmt::join(std::span{b + mid, 16}, " "));
+        }
+    }
+    if (!is_gpu_modified && !is_gpu_dirty && image.info.guest_size <= 4_MB) {
+        // golf-fix diagnostic: report textures uploaded from all-zero guest memory
+        static std::atomic<int> golf_zero_logged{0};
+        if (golf_zero_logged < 24) {
+            const auto* p = std::bit_cast<const u64*>(image.info.guest_address);
+            const size_t n = image.info.guest_size / sizeof(u64);
+            bool all_zero = n > 0;
+            for (size_t i = 0; i < n && all_zero; ++i) {
+                all_zero = p[i] == 0;
+            }
+            if (all_zero) {
+                ++golf_zero_logged;
+                LOG_ERROR(Render, "golf-fix: texture {}x{} at {:#x}+{:#x} uploaded from zero memory",
+                          image.info.size.width, image.info.size.height,
+                          image.info.guest_address, image.info.guest_size);
+            }
+        }
+    }
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);

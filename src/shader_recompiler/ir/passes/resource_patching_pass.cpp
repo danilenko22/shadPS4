@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <limits>
+#include "common/logging/log.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -146,6 +147,12 @@ private:
         const auto it{std::ranges::find_if(descriptors, pred)};
         if (it != descriptors.end()) {
             return static_cast<u32>(std::distance(descriptors.begin(), it));
+        }
+        if (descriptors.size() == descriptors.capacity()) {
+            LOG_ERROR(Render_Recompiler,
+                      "Shader resource list full (capacity {}), reusing binding 0",
+                      descriptors.capacity());
+            return 0;
         }
         descriptors.push_back(desc);
         return static_cast<u32>(descriptors.size()) - 1;

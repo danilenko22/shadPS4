@@ -116,6 +116,9 @@ public:
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
+    /// golf-fix: a GPU DMA copy replaced guest memory; every texture inside it is stale.
+    void InvalidateMemoryFromDma(VAddr address, size_t size);
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
@@ -385,7 +388,11 @@ private:
     void GarbageCollectImages();
     void GarbageCollectSamplers();
 
+    /// golf-fix: copy the top-left region of a larger render target sharing the same memory
+    void SyncFromLargerTarget(ImageId image_id);
+
 private:
+    u64 rt_seq_counter{};
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;

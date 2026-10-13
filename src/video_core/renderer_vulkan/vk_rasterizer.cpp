@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -441,6 +442,52 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     return true;
 }
 
+// golf-fix diagnostic: remember small vertex ranges as they were when the draw was processed and
+// compare them with guest memory when the game submits its next command buffer. A difference
+// means the game was still writing the vertices after the GPU thread had already read them.
+namespace {
+struct GolfVbSnapshot {
+    VAddr addr;
+    std::vector<u8> data;
+};
+std::mutex golf_vb_mutex;
+std::vector<GolfVbSnapshot> golf_vb_snapshots;
+std::atomic<int> golf_vb_logged{0};
+} // namespace
+
+void GolfCheckVertexSnapshots() {
+    std::vector<GolfVbSnapshot> snaps;
+    {
+        std::scoped_lock lk{golf_vb_mutex};
+        snaps.swap(golf_vb_snapshots);
+    }
+    for (const auto& sn : snaps) {
+        if (golf_vb_logged >= 40) {
+            return;
+        }
+        const auto* now = std::bit_cast<const u8*>(sn.addr);
+        if (std::memcmp(now, sn.data.data(), sn.data.size()) == 0) {
+            continue;
+        }
+        u32 diffs = 0;
+        size_t first = 0;
+        for (size_t i = 0; i + 4 <= sn.data.size(); i += 4) {
+            if (std::memcmp(now + i, sn.data.data() + i, 4) != 0) {
+                if (diffs++ == 0) {
+                    first = i;
+                }
+            }
+        }
+        u32 old_v, new_v;
+        std::memcpy(&old_v, sn.data.data() + first, 4);
+        std::memcpy(&new_v, now + first, 4);
+        ++golf_vb_logged;
+        LOG_ERROR(Render, "golf-fix: vertex range {:#x}+{:#x} changed after draw: {} dwords, "
+                          "first at +{:#x} ({:#x} -> {:#x})",
+                  sn.addr, sn.data.size(), diffs, first, old_v, new_v);
+    }
+}
+
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
@@ -500,6 +547,13 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        if (false) { // golf-fix diagnostic disabled
+            std::scoped_lock lk{golf_vb_mutex};
+            if (golf_vb_snapshots.size() < 256) {
+                const auto* src = std::bit_cast<const u8*>(range.base_address);
+                golf_vb_snapshots.push_back({range.base_address, std::vector<u8>(src, src + size)});
+            }
+        }
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
@@ -1225,7 +1279,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             return;
         }
     }
-    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    if (!dst_gds) {
+        texture_cache.InvalidateMemoryFromDma(dst, num_bytes); // golf-fix
+    }
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {

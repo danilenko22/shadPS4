@@ -119,6 +119,12 @@ void BufferCache::TickFrame() {
     }
 }
 
+void BufferCache::ForceCpuReupload(VAddr addr, u64 size) {
+    if (!IsRegionGpuModified(addr, size)) {
+        memory_tracker->MarkRegionAsCpuModified(addr, size);
+    }
+}
+
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, assume_locks);

@@ -155,6 +155,8 @@ public:
     u64 image_uid{};
     u64 lru_id{};
     u64 tick_accessed_last{};
+    u64 rt_write_seq{}; ///< golf-fix: last render target bind sequence
+    u64 synced_seq{};   ///< golf-fix: rt_write_seq of the image last copied into this one
     u64 hash{};
 
     struct {

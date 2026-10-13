@@ -307,6 +307,7 @@ public:
         AmdGpu::ImageType view_type;
         bool is_integer = false;
         bool is_storage = false;
+        bool single_mip = false; // golf-fix v22
         MipStorageFallbackMode mip_fallback_mode{};
     };
 
@@ -355,6 +356,7 @@ public:
     boost::container::small_vector<BufferDefinition, 16> buffers;
     boost::container::small_vector<TextureDefinition, 8> images;
     boost::container::small_vector<Id, 4> samplers;
+    boost::container::small_vector<bool, 4> sampler_same_minmag; // golf-fix v22
     std::unordered_map<u32, Id> first_to_last_label_map;
 
     size_t flatbuf_index{};

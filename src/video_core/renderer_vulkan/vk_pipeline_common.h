@@ -57,6 +57,13 @@ public:
         return is_compute;
     }
 
+    /// golf-fix: point the pipeline back at the live stage infos after an async build
+    void GolfFixRebindStages(std::span<const Shader::Info* const> infos) {
+        for (size_t i = 0; i < infos.size() && i < stages.size(); ++i) {
+            stages[i] = infos[i];
+        }
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 

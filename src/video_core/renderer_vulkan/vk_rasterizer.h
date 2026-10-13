@@ -157,8 +157,12 @@ private:
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
 
-    boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
-    boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+    // Shared by all stages of a pipeline; images and samplers both land in image_infos.
+    boost::container::static_vector<vk::DescriptorImageInfo,
+                                    (Shader::NUM_IMAGES + Shader::NUM_SAMPLERS) * 4>
+        image_infos;
+    boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS * 4>
+        buffer_infos;
 
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;

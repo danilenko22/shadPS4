@@ -79,6 +79,16 @@ Error PS4_SYSV_ABI sceMsgDialogOpen(const OrbisParam* param) {
     ASSERT(param->baseParam.size == sizeof(CommonDialog::BaseParam));
     g_result = {};
     g_state = MsgDialogState{*param};
+    if (g_state.GetMode() == MsgDialogMode::SYSTEM_MSG &&
+        g_state.GetState<MsgDialogState::SystemState>().type ==
+            SystemMessageType::TRC_EMPTY_STORE) {
+        // golf-fix: offline the game opens this every frame on the PS Store tab; the popup
+        // flashed and could not be dismissed. Answer it at once like a pressed OK.
+        g_result.result = CommonDialog::Result::OK;
+        g_result.buttonId = ButtonId::OK;
+        g_status = Status::FINISHED;
+        return Error::OK;
+    }
     g_status = Status::RUNNING;
     g_msg_dialog_ui = MsgDialogUi(&g_state, &g_status, &g_result);
     return Error::OK;

@@ -99,6 +99,9 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// golf-fix: re-read a small CPU-written range from guest memory on the next upload
+    void ForceCpuReupload(VAddr addr, u64 size);
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 

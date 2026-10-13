@@ -146,6 +146,7 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::ReadFirstLane:
     case IR::Opcode::WriteLane:
         info.uses_group_ballot = true;
+        info.uses_lane_id = true; // golf-fix: WriteLane now reads the lane id
         break;
     case IR::Opcode::Discard:
     case IR::Opcode::DiscardCond:
