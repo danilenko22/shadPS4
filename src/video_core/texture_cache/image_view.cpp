@@ -118,6 +118,30 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
 
+    // NBA LIVE 19: en texturas comprimidas por bloques, los niveles menores que un bloque
+    // (ambas dimensiones < 4 texeles) no suelen tener datos validos (el juego no los genera y se
+    // quedan con basura -> destellos en reflejos). Las vistas de muestreo se limitan al ultimo
+    // nivel de bloque completo; la GPU usa ese nivel como el mas pequeno.
+    u32 level_count = info.range.extent.levels;
+    if (!info.is_storage && image.info.props.is_block && !image.info.props.is_volume &&
+        vk::to_string(format).find("Block") != std::string::npos) {
+        u32 last_full = 0;
+        for (u32 m = 0; m < image.info.resources.levels; m++) {
+            if (std::max(image.info.size.width >> m, 1u) >= 4 ||
+                std::max(image.info.size.height >> m, 1u) >= 4) {
+                last_full = m;
+            }
+        }
+        if (last_full >= info.range.base.level) {
+            level_count = std::min(level_count, last_full - info.range.base.level + 1);
+        }
+    }
+
+    if (usage_ci.pNext == &min_lod_ci) {
+        min_lod_ci.minLod = std::min(min_lod_ci.minLod,
+                                     static_cast<float>(info.range.base.level + level_count - 1));
+    }
+
     const auto components = info.mapping == AmdGpu::IdentityMapping
                                 ? vk::ComponentMapping{}
                                 : Vulkan::LiverpoolToVK::ComponentMapping(info.mapping);
@@ -131,7 +155,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         .subresourceRange{
             .aspectMask = aspect,
             .baseMipLevel = info.range.base.level,
-            .levelCount = info.range.extent.levels,
+            .levelCount = level_count,
             .baseArrayLayer = info.range.base.layer,
             .layerCount = info.range.extent.layers,
         },

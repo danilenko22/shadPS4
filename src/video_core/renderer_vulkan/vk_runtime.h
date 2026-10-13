@@ -54,6 +54,8 @@ public:
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                              const VideoCore::Buffer* buffer, u64 offset);
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);
+    /// Copia el contenido de un nivel de mip a otro dentro de la misma imagen (todas las capas).
+    void ReplicateMip(VideoCore::Image* image, u32 src_mip, u32 dst_mip);
 
     void CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst);
 

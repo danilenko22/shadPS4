@@ -381,6 +381,50 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+void Runtime::ReplicateMip(VideoCore::Image* image, u32 src_mip, u32 dst_mip) {
+    const auto& info = image->info;
+    const u32 w = std::min(std::max(info.size.width >> src_mip, 1u),
+                           std::max(info.size.width >> dst_mip, 1u));
+    const u32 h = std::min(std::max(info.size.height >> src_mip, 1u),
+                           std::max(info.size.height >> dst_mip, 1u));
+    const vk::ImageCopy image_copy{
+        .srcSubresource{
+            .aspectMask = image->aspect_mask,
+            .mipLevel = src_mip,
+            .baseArrayLayer = 0,
+            .layerCount = info.resources.layers,
+        },
+        .dstSubresource{
+            .aspectMask = image->aspect_mask,
+            .mipLevel = dst_mip,
+            .baseArrayLayer = 0,
+            .layerCount = info.resources.layers,
+        },
+        .extent = {w, h, 1u},
+    };
+
+    SetBackingSamples(image, info.num_samples);
+    scheduler.EndRendering();
+    if (Transit(image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite)) {
+        FlushBarriers();
+    }
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.copyImage(image->GetImage(), vk::ImageLayout::eGeneral, image->GetImage(),
+                     vk::ImageLayout::eGeneral, image_copy);
+    // Que la copia termine antes de cualquier uso posterior de la imagen
+    const vk::MemoryBarrier2 post_copy_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1u,
+        .pMemoryBarriers = &post_copy_barrier,
+    });
+}
+
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);

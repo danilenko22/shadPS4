@@ -22,6 +22,8 @@
 
 namespace VideoCore {
 
+
+
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
@@ -244,6 +246,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         // Inherit image usage
         auto& new_image = slot_images[new_image_id];
         new_image.usage = cache_image.usage;
+        if (new_info.props.is_block &&
+            new_info.resources.levels > cache_image.info.resources.levels) {
+            new_image.guest_valid_levels = cache_image.guest_valid_levels
+                                               ? cache_image.guest_valid_levels
+                                               : cache_image.info.resources.levels;
+        }
         if (new_info.num_samples == 1 &&
             (new_info.resources.layers > cache_image.info.resources.layers ||
              new_info.resources.levels > cache_image.info.resources.levels)) {
@@ -502,7 +510,27 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
+    if (info.props.is_block && info.resources.levels > src_image.info.resources.levels) {
+        new_image.guest_valid_levels = src_image.guest_valid_levels
+                                           ? src_image.guest_valid_levels
+                                           : src_image.info.resources.levels;
+    }
     RefreshImage(new_image);
+    // Vista comprimida de una imagen sin comprimir (p.ej. BC6H generado por la GPU via R32G32B32A32).
+    // El juego solo escribe los niveles de al menos un bloque; los niveles menores (texeles < 4x4)
+    // quedan sin inicializar. Se rellenan desde el ultimo nivel de bloque completo antes de copiar.
+    if (info.props.is_block && !src_image.info.props.is_block) {
+        const u32 levels = std::min(info.resources.levels, src_image.info.resources.levels);
+        u32 last_full = 0;
+        for (u32 m = 0; m < levels; m++) {
+            if (std::max(info.size.width >> m, 1u) >= 4 || std::max(info.size.height >> m, 1u) >= 4) {
+                last_full = m;
+            }
+        }
+        for (u32 m = last_full + 1; m < levels; m++) {
+            runtime.ReplicateMip(&src_image, last_full, m);
+        }
+    }
     runtime.CopyImage(&src_image, &new_image);
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
@@ -791,6 +819,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
+
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
@@ -800,7 +829,19 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 height = std::max(image.info.size.height >> m, 1u);
         const u32 depth =
             image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
-        const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
+        // Los niveles sin memoria propia se cargan desde el ultimo nivel valido (ver image.h).
+        // En formatos por bloques, los niveles menores que un bloque (ambas dimensiones < 4) no los
+        // generan las herramientas de texturas: se toman del ultimo nivel de al menos un bloque.
+        u32 src_mip = image.guest_valid_levels && m >= image.guest_valid_levels
+                          ? image.guest_valid_levels - 1
+                          : m;
+        if (image.info.props.is_block && !image.info.props.is_volume) {
+            while (src_mip > 0 && std::max(image.info.size.width >> src_mip, 1u) < 4 &&
+                   std::max(image.info.size.height >> src_mip, 1u) < 4) {
+                --src_mip;
+            }
+        }
+        const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[src_mip];
         const u32 extent_width = mip_pitch ? std::min<u32>(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min<u32>(mip_height, height) : height;
         image_copies.push_back({

@@ -156,6 +156,10 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    // Niveles de mip respaldados por memoria real del guest. Si una imagen comprimida se amplia
+    // con mas niveles de los que tenia (p.ej. 7 -> 9), los niveles extra no existen en memoria y
+    // leerlos traeria datos de otro recurso; se rellenan desde el ultimo nivel valido. 0 = todos.
+    u32 guest_valid_levels{};
 
     struct {
         u32 texture : 1;
