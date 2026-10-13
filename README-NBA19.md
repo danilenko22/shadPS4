@@ -18,6 +18,7 @@
 |---|---|---|
 | Se queda para siempre en "CARGANDO" | En Windows, `TimedMutex::try_lock_until` devolvía *timeout* sin intentar coger el mutex cuando el plazo ya había vencido (timeout 0). El juego usa un *timed lock* con 0 µs como *trylock*. | `src/core/libraries/kernel/sync/mutex.h`: intentar `try_lock()` una vez cuando el plazo ha vencido (igual que `std::timed_mutex`). |
 | Destellos / "fuego" en pelo, piel, ropa, banquillo y suelo (aleatorio por sesión) | Los cubemaps de reflejos BC6H solo tienen datos hasta el nivel de 4x4; el juego los declara con más niveles y los niveles 2x2/1x1 contenían basura (memoria ajena o nunca escrita). | `texture_cache/image_view.cpp`: las vistas de muestreo de texturas comprimidas por bloques terminan en el último nivel de bloque completo. Refuerzos en `texture_cache.cpp`, `image.h` y `vk_runtime.cpp` (`guest_valid_levels`, `ReplicateMip`). |
+| Cierre con "Out of order flip IRQ" (sobre todo con `vblank_frequency: 120`) | Con vblank alto puede llegar la IRQ de flip EOP de un búfer que ya no está pendiente y el emulador abortaba. | `src/core/libraries/videoout/video_out.cpp`: se registra un aviso y se ignora esa IRQ en vez de cerrar. (v2) |
 | — | Límites de memoria compartida (LDS) en shaders de cómputo | PR oficial pendiente [#4796](https://github.com/shadps4-emu/shadPS4/pull/4796), adaptado a esta base. |
 
 También incluye cambios menores heredados de un trabajo anterior con FIFA 14

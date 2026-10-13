@@ -352,7 +352,12 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
+            if (port->buffer_labels[buf_id] != 1) {
+                // With a high vblank frequency the EOP flip IRQ can arrive for a buffer that is no
+                // longer pending; ignore it like the hardware would instead of aborting.
+                LOG_WARNING(Lib_VideoOut, "Out of order flip IRQ for buffer {} ignored", buf_id);
+                return;
+            }
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
             ASSERT_MSG(result, "EOP flip submission failed");
         });
