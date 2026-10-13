@@ -468,14 +468,16 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         return {{}, -1, -1};
     } else {
         // Left overlap, the image from cache is a possible subresource of the image requested
-        if (auto mip = cache_image.info.MipOf(image_info); mip >= 0) {
-            if (auto slice = cache_image.info.SliceOf(image_info, mip); slice >= 0) {
+        if (auto mip = cache_image.info.MipOf(image_info, true); mip >= 0) {
+            if (auto slice = cache_image.info.SliceOf(image_info, mip, true); slice >= 0) {
                 // We have a larger image created and a separate one, representing a subres of it
                 // bound as render target. In this case we need to rebind render target.
                 if (cache_image.binding.is_target) {
                     cache_image.binding.needs_rebind = 1u;
                     if (merged_image_id) {
-                        GetImage(merged_image_id).binding.is_target = 1u;
+                        auto& merged_image = GetImage(merged_image_id);
+                        merged_image.binding.is_target = 1u;
+                        runtime.CopyMip(&cache_image, &merged_image, mip, slice);
                     }
 
                     FreeImage(cache_image_id);
@@ -521,6 +523,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+
+    // Resolve overlaps from the lowest address, so an image at the requested address is merged
+    // before the subresources that have to be copied into it.
+    std::ranges::stable_sort(image_ids, {}, [&](ImageId id) {
+        return slot_images[id].info.guest_address;
+    });
 
     ImageId image_id{};
 

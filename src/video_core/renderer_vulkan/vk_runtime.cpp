@@ -388,9 +388,12 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     const auto mip_block_p = std::max<u32>(dst->info.mips_layout[mip].pitch >> dst_dim, 1u);
 
     const auto src_dim = src->info.props.is_block ? 2 : 0;
-    ASSERT(mip_block_w == (src->info.size.width >> src_dim));
-    ASSERT(mip_block_h == (src->info.size.height >> src_dim));
+    // Small mips may be rendered with their tile padded extent, only the mip extent is copied.
+    ASSERT(mip_block_w <= (src->info.size.width >> src_dim));
+    ASSERT(mip_block_h <= (src->info.size.height >> src_dim));
     ASSERT(mip_block_p == (src->info.pitch >> src_dim));
+    const auto mip_w = std::max(dst->info.size.width >> mip, 1u);
+    const auto mip_h = std::max(dst->info.size.height >> mip, 1u);
 
     const auto [src_layers, dst_layers] =
         SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
@@ -408,7 +411,8 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
             .baseArrayLayer = slice,
             .layerCount = dst_layers,
         },
-        .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+        .extent = {std::min(src->info.size.width, mip_w), std::min(src->info.size.height, mip_h),
+                   src->info.size.depth},
     };
 
     SetBackingSamples(dst, dst->info.num_samples);

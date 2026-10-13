@@ -53,8 +53,9 @@ struct ImageInfo {
         return Extent2D{pitch >> dim, size.height >> dim};
     }
 
-    s32 MipOf(const ImageInfo& info) const;
-    s32 SliceOf(const ImageInfo& info, s32 mip) const;
+    s32 MipOf(const ImageInfo& info, bool allow_padded = false) const;
+    s32 SliceOf(const ImageInfo& info, s32 mip, bool allow_padded = false) const;
+    bool MatchesMipExtent(const ImageInfo& info, s32 mip, bool allow_padded) const;
 
     bool IsCompatible(const ImageInfo& info) const;
     void UpdateSize() noexcept;

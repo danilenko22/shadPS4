@@ -6,6 +6,9 @@
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
+#include <algorithm>
+#include <optional>
+
 #include "SDL3/SDL_log.h"
 #include "common/singleton.h"
 #include "common/types.h"
@@ -291,11 +294,17 @@ void L::DrawSimple() {
     PopStyleColor();
 }
 
+static std::optional<float> saved_pp_gamma;
+
 static void LoadSettings(const char* line) {
     int i;
     float f;
     if (sscanf(line, "fps_scale=%f", &f) == 1) {
         fps_scale = f;
+        return;
+    }
+    if (sscanf(line, "pp_gamma=%f", &f) == 1) {
+        saved_pp_gamma = std::clamp(f, 0.1f, 2.0f);
         return;
     }
     if (sscanf(line, "show_advanced_debug=%d", &i) == 1) {
@@ -362,6 +371,9 @@ void L::SetupSettings() {
     handler.WriteAllFn = [](ImGuiContext*, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf) {
         buf->appendf("[%s][Data]\n", handler->TypeName);
         buf->appendf("fps_scale=%f\n", fps_scale);
+        if (presenter) {
+            buf->appendf("pp_gamma=%f\n", presenter->GetPPSettingsRef().gamma);
+        }
         buf->appendf("show_advanced_debug=%d\n", DebugState.IsShowingDebugMenuBar());
         buf->appendf("show_frame_graph=%d\n", frame_graph.is_open);
         buf->appendf("show_shader_list=%d\n", shader_list.open);
@@ -393,6 +405,11 @@ bool L::ShouldKeepDrawing() {
 void L::Draw() {
     const auto io = GetIO();
     PushID("DevtoolsLayer");
+
+    if (saved_pp_gamma && presenter) {
+        presenter->GetPPSettingsRef().gamma = *saved_pp_gamma;
+        saved_pp_gamma.reset();
+    }
 
     if (!DebugState.IsGuestThreadsPaused()) {
         const auto fn = DebugState.flip_frame_count.load();

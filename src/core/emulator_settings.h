@@ -430,10 +430,12 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
+    Setting<bool> ignore_flip_rate{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
             make_override<GPUSettings>("null_gpu", &GPUSettings::null_gpu),
+            make_override<GPUSettings>("ignore_flip_rate", &GPUSettings::ignore_flip_rate),
             make_override<GPUSettings>("copy_gpu_buffers", &GPUSettings::copy_gpu_buffers),
             make_override<GPUSettings>("full_screen", &GPUSettings::full_screen),
             make_override<GPUSettings>("full_screen_mode", &GPUSettings::full_screen_mode),
@@ -741,6 +743,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)
     SETTING_FORWARD_BOOL(m_gpu, DumpShaders, dump_shaders)
     SETTING_FORWARD_BOOL(m_gpu, CopyGpuBuffers, copy_gpu_buffers)
+    SETTING_FORWARD_BOOL(m_gpu, IgnoreFlipRate, ignore_flip_rate)
     SETTING_FORWARD_BOOL(m_gpu, FullScreen, full_screen)
     SETTING_FORWARD(m_gpu, FullScreenMode, full_screen_mode)
     SETTING_FORWARD(m_gpu, PresentMode, present_mode)

@@ -192,12 +192,24 @@ void ImageInfo::UpdateSize() noexcept {
                      &guest_size, &micro_tiled_mips, mips_layout.data());
 }
 
-s32 ImageInfo::MipOf(const ImageInfo& info) const {
-    if (!IsCompatible(info)) {
-        return -1;
+bool ImageInfo::MatchesMipExtent(const ImageInfo& info, s32 mip, bool allow_padded) const {
+    const auto info_dim = info.props.is_block ? 2 : 0;
+    const auto this_dim = props.is_block ? 2 : 0;
+    const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
+    const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
+    const auto this_w = std::max(size.width >> this_dim, 1u);
+    const auto this_h = std::max(size.height >> this_dim, 1u);
+    if (this_w == mip_w && this_h == mip_h) {
+        return true;
     }
+    // A small mip can be bound with the extent it is padded to in memory.
+    const auto& layout = info.mips_layout[mip];
+    return allow_padded && this_w == (layout.pitch >> info_dim) &&
+           this_h == (layout.height >> info_dim);
+}
 
-    if (info.array_mode != array_mode) {
+s32 ImageInfo::MipOf(const ImageInfo& info, bool allow_padded) const {
+    if (!IsCompatible(info)) {
         return -1;
     }
 
@@ -209,6 +221,17 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     const auto info_dim = info.props.is_block ? 2 : 0;
     const auto this_dim = props.is_block ? 2 : 0;
 
+    // Macro tiled thin images degrade small mips to 1D tiling, so a mip may be bound on its own
+    // with a different array mode than the full image.
+    const auto is_array_mode_compatible = [&](u32 m) {
+        if (info.array_mode == array_mode) {
+            return true;
+        }
+        const bool degraded_mip = (info.micro_tiled_mips & (1u << m)) != 0;
+        return degraded_mip && array_mode == AmdGpu::ArrayMode::Array1DTiledThin1 &&
+               AmdGpu::GetMicroTileThickness(info.array_mode) == 1;
+    };
+
     // Find mip
     auto mip = -1;
     for (auto m = 0; m < info.resources.levels; ++m) {
@@ -216,7 +239,7 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
         const VAddr mip_base = info.guest_address + mip_ofs;
         const VAddr mip_end = mip_base + mip_size;
         const u32 slice_size = mip_size / info.resources.layers;
-        if (guest_address >= mip_base && guest_address < mip_end &&
+        if (is_array_mode_compatible(m) && guest_address >= mip_base && guest_address < mip_end &&
             (guest_address - mip_base) % slice_size == 0 &&
             (pitch >> this_dim) == (mip_pitch >> info_dim)) {
             mip = m;
@@ -229,11 +252,7 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     }
 
     // 2D block dimensions of both images should be the same.
-    const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
-    const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
-    const auto this_w = std::max(size.width >> this_dim, 1u);
-    const auto this_h = std::max(size.height >> this_dim, 1u);
-    if ((this_w != mip_w) || (this_h != mip_h)) {
+    if (!MatchesMipExtent(info, mip, allow_padded)) {
         return -1;
     }
 
@@ -252,7 +271,7 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     return mip;
 }
 
-s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
+s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip, bool allow_padded) const {
     if (!IsCompatible(info)) {
         return -1;
     }
@@ -264,15 +283,10 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
 
     // 2D block dimensions of both images should be the same.
     const auto info_dim = info.props.is_block ? 2 : 0;
-    const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
-    const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
     const auto mip_p = std::max<u32>(info.mips_layout[mip].pitch >> info_dim, 1u);
-
     const auto this_dim = props.is_block ? 2 : 0;
-    const auto this_w = std::max(size.width >> this_dim, 1u);
-    const auto this_h = std::max(size.height >> this_dim, 1u);
     const auto this_p = std::max(pitch >> this_dim, 1u);
-    if ((this_w != mip_w) || (this_h != mip_h) || (this_p != mip_p)) {
+    if (!MatchesMipExtent(info, mip, allow_padded) || (this_p != mip_p)) {
         return -1;
     }
 

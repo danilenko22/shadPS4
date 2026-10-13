@@ -139,8 +139,9 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 }
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
-    LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    const bool ignore = EmulatorSettings.IsIgnoreFlipRate();
+    LOG_INFO(Lib_VideoOut, "handle = {}, rate = {}{}", handle, rate, ignore ? " (ignored)" : "");
+    driver->GetPort(handle)->flip_rate = ignore ? 0 : rate;
     return ORBIS_OK;
 }
 
@@ -401,6 +402,7 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    LOG_INFO(Lib_VideoOut, "handle = {}, gamma = {}", handle, settings->gamma);
     presenter->GetPPSettingsRef().gamma = settings->gamma;
     return ORBIS_OK;
 }
