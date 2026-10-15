@@ -1,0 +1,35 @@
+FIX PELAJE - Crash Team Racing Nitro-Fueled (CUSA13795) en shadPS4
+==================================================================
+
+PROBLEMA
+  La piel/pelaje de los personajes (Coco, Crash, etc.) se ve con puntitos grises.
+
+CAUSA (encontrada con RenderDoc)
+  El pelaje se dibuja con 6 capas (geometry shader). En las capas 1-5 el pixel
+  shader entra en una rama de "raymarching" de pelo (condicion 0.0 < indice_de_capa).
+  En shadPS4 esa rama devuelve un color casi constante y gris -> puntitos en el
+  G-buffer de albedo. No es el TAA ni FSR/RCAS (probado).
+
+ARREGLO
+  Se parchea el SPIR-V de los pixel shaders de PIEL para descartar (OpKill) las
+  capas de pelaje 1-5 (indice de capa > 0). Solo se dibuja la capa base:
+  piel lisa, sin puntitos, y sin tapar la base del cabello.
+  (Una version anterior forzaba la rama a falso: las capas se dibujaban enteras
+  con color de piel y tapaban el cabello rubio con naranja. Descartada.)
+  El cabello (ej. Coco rubio) usa el mismo sistema pero en shaders propios
+  (bd4b295e). Esos NO se parchean: el script los excluye (lista EXCLUIR).
+
+INSTALACION
+  1. Copiar shader_patch\*.spv a  %APPDATA%\shadPS4\shader\patch\
+  2. Copiar custom_configs\CUSA13795.json a  %APPDATA%\shadPS4\custom_configs\
+     (activa patch_shaders, apaga FSR y RCAS)
+
+SI ALGUN PERSONAJE SIGUE CON PUNTITOS
+  Usa un shader con otro hash que todavia no se parcheo:
+  1. En CUSA13795.json poner "dump_shaders": true
+  2. Abrir el juego y pasar por todos los personajes / pistas
+  3. Ejecutar:
+       python -I spv_furpatch.py "%APPDATA%\shadPS4\shader\dumps" "%APPDATA%\shadPS4\shader\patch"
+  4. Volver a poner "dump_shaders": false
+  5. Si a algun personaje le falta pelo despues de esto, borrar de shader\patch
+     el .spv nuevo de ese personaje y agregar su hash a EXCLUIR en el script.
