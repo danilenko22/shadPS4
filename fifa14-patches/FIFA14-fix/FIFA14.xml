@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Patch>
+    <!-- FIFA 14 (CUSA00128, EUR) v01.06.
+         The eboot is linked at 0x400000 and shadPS4 maps it at base + p_vaddr, while patch
+         addresses are applied as base + (Address - 0x400000), so Address = ELF address + 0x400000. -->
+    <Metadata Title="FIFA 14"
+              Name="60 FPS in replays and cutscenes"
+              Note="Keeps replays and cutscenes at 60 FPS. ELF 0xE88A34: flip interval clamp 3 -> 1. ELF 0xE27B97 / 0xE27B9F: end of frame wait for intervals 3 and 2, 50 / 33 ms -> 16 ms."
+              Author="danilenko22"
+              PatchVer="1.2"
+              AppVer="01.06"
+              AppElf="eboot.bin"
+              isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x1288A35" Value="01"/>
+            <Line Type="bytes" Address="0x1288A3B" Value="01"/>
+            <Line Type="bytes" Address="0x1227B99" Value="10"/>
+            <Line Type="bytes" Address="0x1227BA1" Value="10"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="FIFA 14"
+              Name="Scene limiter 40 -> 60"
+              Note="Raises the 40 Hz scene scheduler limiter (ELF 0x401D03, call at 0x401D08) to 60 Hz."
+              Author="danilenko22"
+              PatchVer="1.1"
+              AppVer="01.06"
+              AppElf="eboot.bin"
+              isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x801D04" Value="3C"/>
+        </PatchList>
+    </Metadata>
+</Patch>
